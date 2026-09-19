@@ -1884,8 +1884,14 @@ struct OutputConfig {
     format: OutputFormat,
 }
 
+/// The wire-shaped Anthropic `/v1/messages` payload.
+///
+/// `pub` so that downstream crates can build one with
+/// [`AnthropicRequestParams`] and assert on the exact JSON they will put on the
+/// wire (cache breakpoint placement in particular). The fields stay private —
+/// the only supported way to construct it is the `TryFrom` conversion.
 #[derive(Debug, Deserialize, Serialize)]
-pub(super) struct AnthropicCompletionRequest {
+pub struct AnthropicCompletionRequest {
     model: String,
     messages: Vec<Message>,
     max_tokens: u64,
