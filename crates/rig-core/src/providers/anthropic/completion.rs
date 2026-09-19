@@ -321,6 +321,8 @@ pub enum Content {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ServerToolUse {
         id: String,
@@ -1107,6 +1109,7 @@ impl TryFrom<message::AssistantContent> for Content {
                     id,
                     name: function.name,
                     input: coerce_tool_input(function.arguments),
+                    cache_control: None,
                 })
             }
             message::AssistantContent::Reasoning(reasoning) => Ok(Content::Thinking {
@@ -1154,6 +1157,7 @@ fn anthropic_content_from_assistant_content(
                 id,
                 name: function.name,
                 input: coerce_tool_input(function.arguments),
+                cache_control: None,
             }])
         }
         message::AssistantContent::Reasoning(reasoning) => {
@@ -1408,9 +1412,9 @@ impl TryFrom<Content> for message::AssistantContent {
                     additional_params,
                 })
             }
-            Content::ToolUse { id, name, input } => {
-                message::AssistantContent::tool_call(id, name, input)
-            }
+            Content::ToolUse {
+                id, name, input, ..
+            } => message::AssistantContent::tool_call(id, name, input),
             raw @ (Content::ServerToolUse { .. }
             | Content::WebSearchToolResult { .. }
             | Content::CodeExecutionToolResult { .. }) => {
@@ -1921,6 +1925,7 @@ fn set_content_cache_control(content: &mut Content, value: Option<CacheControl>)
         Content::Text { cache_control, .. } => *cache_control = value,
         Content::Image { cache_control, .. } => *cache_control = value,
         Content::ToolResult { cache_control, .. } => *cache_control = value,
+        Content::ToolUse { cache_control, .. } => *cache_control = value,
         Content::Document { cache_control, .. } => *cache_control = value,
         _ => {}
     }
@@ -2843,7 +2848,9 @@ mod tests {
             }
 
             match iter.next().unwrap() {
-                Content::ToolUse { id, name, input } => {
+                Content::ToolUse {
+                    id, name, input, ..
+                } => {
                     assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
                     assert_eq!(name, "get_weather");
                     assert_eq!(input, json!({"location": "San Francisco, CA"}));
@@ -2943,6 +2950,7 @@ mod tests {
                 id: "toolu_01A09q90qw90lq917835lq9".to_string(),
                 name: "get_weather".to_string(),
                 input: json!({"location": "San Francisco, CA"}),
+                cache_control: None,
             }),
         };
 
@@ -3654,6 +3662,41 @@ mod tests {
         assert!(last_block_cache_control(&messages[2]).is_some());
         assert!(last_block_cache_control(&messages[1]).is_none());
         assert!(last_block_cache_control(&messages[0]).is_none());
+    }
+
+    /// A trailing `tool_use` block is markable (Anthropic accepts `cache_control` on it),
+    /// so the plan must actually write the marker there — not silently spend the budget on
+    /// a block it cannot annotate.
+    #[test]
+    fn claude_code_plan_marks_a_trailing_tool_use_block() {
+        let mut system = vec![text_system("static")];
+        let mut messages = vec![
+            user_text("q1"),
+            message_with(
+                Role::Assistant,
+                vec![Content::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "calc".to_string(),
+                    input: json!({}),
+                    cache_control: None,
+                }],
+            ),
+        ];
+        let mut tools: Vec<serde_json::Value> = vec![];
+
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::ClaudeCode,
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&messages[1]).unwrap();
+        assert_eq!(value["content"][0]["type"], "tool_use");
+        assert_eq!(value["content"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
