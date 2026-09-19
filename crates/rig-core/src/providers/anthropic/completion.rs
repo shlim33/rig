@@ -175,6 +175,25 @@ pub enum CacheTtl {
     OneHour,
 }
 
+/// Which layout of manual cache breakpoints a request uses.
+///
+/// Both plans respect Anthropic's limit of four `cache_control` markers per request and
+/// the marker TTL ordering rules; they differ only in *where* the generated markers land.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CachePlan {
+    /// Rig's default layout: the final non-deferred tool definition, the **last** system
+    /// block, and the last content block of the last message.
+    #[default]
+    Rig,
+    /// Claude Code's layout: the **first** system block only — the static prefix, so that
+    /// per-turn edits in a trailing dynamic system block do not invalidate it — plus the
+    /// last content block of the last message, skipped entirely when that block is
+    /// `thinking` or `redacted_thinking` (no fallback to an earlier block). Tool
+    /// definitions are never marked: they precede the system blocks in the cached prefix,
+    /// so the system marker already covers them.
+    ClaudeCode,
+}
+
 /// Cache control directive for Anthropic prompt caching.
 ///
 /// Serialises to `{"type":"ephemeral"}` (default TTL) or
@@ -1558,6 +1577,10 @@ pub struct GenericCompletionModel<Ext = super::client::AnthropicExt, T = reqwest
     /// TTL for automatic caching. `None` uses the API default (5 minutes).
     /// Set to `Some(CacheTtl::OneHour)` for a 1-hour TTL.
     pub automatic_caching_ttl: Option<CacheTtl>,
+    /// Layout used for the manual cache breakpoints added by [`with_prompt_caching`].
+    ///
+    /// [`with_prompt_caching`]: GenericCompletionModel::with_prompt_caching
+    pub cache_plan: CachePlan,
 }
 
 /// Anthropic completion model.
@@ -1583,6 +1606,7 @@ where
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::default(),
         }
     }
 
@@ -1595,6 +1619,7 @@ where
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::default(),
         }
     }
 
@@ -1617,6 +1642,18 @@ where
     /// [`with_automatic_caching`]: CompletionModel::with_automatic_caching
     pub fn with_prompt_caching(mut self) -> Self {
         self.prompt_caching = true;
+        self
+    }
+
+    /// Choose the layout of the manual cache breakpoints added by [`with_prompt_caching`].
+    ///
+    /// Defaults to [`CachePlan::Rig`]. Use [`CachePlan::ClaudeCode`] when the caller splits
+    /// its system prompt into a static prefix block followed by a per-turn dynamic block and
+    /// wants only that prefix cached.
+    ///
+    /// [`with_prompt_caching`]: GenericCompletionModel::with_prompt_caching
+    pub fn with_cache_plan(mut self, cache_plan: CachePlan) -> Self {
+        self.cache_plan = cache_plan;
         self
     }
 
@@ -2104,6 +2141,27 @@ fn apply_system_cache_control(
     }
 }
 
+/// Mark the *first* system block — the static prefix under [`CachePlan::ClaudeCode`].
+///
+/// Leaving the trailing block unmarked keeps a per-turn dynamic system block out of the
+/// cached prefix, so editing it does not invalidate the cache entry.
+fn apply_static_system_cache_control(
+    system: &mut [SystemContent],
+    remaining_cache_markers: &mut usize,
+    cache_control_value: &CacheControl,
+) {
+    if *remaining_cache_markers == 0 {
+        return;
+    }
+
+    if let Some(SystemContent::Text { cache_control, .. }) = system.first_mut()
+        && cache_control.is_none()
+    {
+        *cache_control = Some(cache_control_value.clone());
+        *remaining_cache_markers -= 1;
+    }
+}
+
 fn clear_message_cache_control(messages: &mut [Message]) {
     for msg in messages.iter_mut() {
         for content in msg.content.iter_mut() {
@@ -2116,6 +2174,7 @@ fn apply_message_cache_control(
     messages: &mut [Message],
     remaining_cache_markers: &mut usize,
     cache_control: &CacheControl,
+    cache_plan: CachePlan,
 ) {
     clear_message_cache_control(messages);
 
@@ -2124,7 +2183,18 @@ fn apply_message_cache_control(
     }
 
     if let Some(last_msg) = messages.last_mut() {
-        set_content_cache_control(last_msg.content.last_mut(), Some(cache_control.clone()));
+        let last_block = last_msg.content.last_mut();
+        // Claude Code drops the message breakpoint when the final block is a thinking block
+        // instead of walking back to an earlier one (`claude.ts:655-662`).
+        if matches!(cache_plan, CachePlan::ClaudeCode)
+            && matches!(
+                last_block,
+                Content::Thinking { .. } | Content::RedactedThinking { .. }
+            )
+        {
+            return;
+        }
+        set_content_cache_control(last_block, Some(cache_control.clone()));
         *remaining_cache_markers -= 1;
     }
 }
@@ -2135,6 +2205,7 @@ pub(super) fn apply_prompt_cache_control(
     tools: &mut [serde_json::Value],
     prompt_caching: bool,
     top_level_cache_control: Option<&CacheControl>,
+    cache_plan: CachePlan,
 ) -> Result<(), CompletionError> {
     normalize_tool_cache_control(tools);
 
@@ -2161,16 +2232,29 @@ pub(super) fn apply_prompt_cache_control(
         let generated_cache_control =
             build_cache_control(top_level_cache_control_ttl(top_level_cache_control));
 
-        apply_tool_cache_control(
-            tools,
-            &mut remaining_cache_markers,
-            &generated_cache_control,
-        )?;
-        apply_system_cache_control(
-            system,
-            &mut remaining_cache_markers,
-            &generated_cache_control,
-        );
+        match cache_plan {
+            CachePlan::Rig => {
+                apply_tool_cache_control(
+                    tools,
+                    &mut remaining_cache_markers,
+                    &generated_cache_control,
+                )?;
+                apply_system_cache_control(
+                    system,
+                    &mut remaining_cache_markers,
+                    &generated_cache_control,
+                );
+            }
+            // Claude Code marks no tool definition: tools precede the system blocks in the
+            // cached prefix, so the static system marker already covers them.
+            CachePlan::ClaudeCode => {
+                apply_static_system_cache_control(
+                    system,
+                    &mut remaining_cache_markers,
+                    &generated_cache_control,
+                );
+            }
+        }
 
         if top_level_cache_control.is_some() {
             clear_message_cache_control(messages);
@@ -2179,6 +2263,7 @@ pub(super) fn apply_prompt_cache_control(
                 messages,
                 &mut remaining_cache_markers,
                 &generated_cache_control,
+                cache_plan,
             );
         }
     }
@@ -2317,6 +2402,8 @@ pub struct AnthropicRequestParams<'a> {
     pub automatic_caching: bool,
     /// TTL for the top-level cache_control. `None` omits the `ttl` field (API default is 5 min).
     pub automatic_caching_ttl: Option<CacheTtl>,
+    /// Layout for the manual cache breakpoints applied when `prompt_caching` is set.
+    pub cache_plan: CachePlan,
 }
 
 impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
@@ -2329,6 +2416,7 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             prompt_caching,
             automatic_caching,
             automatic_caching_ttl,
+            cache_plan,
         } = params;
         let chat_history = req.chat_history_with_documents();
 
@@ -2383,6 +2471,7 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             &mut tools,
             prompt_caching,
             top_level_cache_control.as_ref(),
+            cache_plan,
         )?;
 
         let output_config = if let Some(schema) = req.output_schema {
@@ -2510,6 +2599,7 @@ where
             prompt_caching: self.prompt_caching,
             automatic_caching: self.automatic_caching,
             automatic_caching_ttl: self.automatic_caching_ttl.clone(),
+            cache_plan: self.cache_plan,
         })?;
 
         if enabled!(Level::TRACE) {
@@ -3140,6 +3230,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3176,6 +3267,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3215,6 +3307,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3296,6 +3389,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3349,6 +3443,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3386,6 +3481,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3419,6 +3515,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3484,6 +3581,159 @@ mod tests {
         assert_eq!(remaining_cache_markers, 3);
     }
 
+    fn text_system(text: &str) -> SystemContent {
+        SystemContent::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }
+    }
+
+    fn text_content(text: &str) -> Content {
+        Content::Text {
+            text: text.to_string(),
+            citations: Vec::new(),
+            cache_control: None,
+        }
+    }
+
+    fn message_with(role: Role, content: Vec<Content>) -> Message {
+        Message {
+            role,
+            content: OneOrMany::many(content).expect("message needs at least one block"),
+        }
+    }
+
+    fn user_text(text: &str) -> Message {
+        message_with(Role::User, vec![text_content(text)])
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        message_with(Role::Assistant, vec![text_content(text)])
+    }
+
+    fn system_cache_control(block: &SystemContent) -> Option<CacheControl> {
+        let SystemContent::Text { cache_control, .. } = block;
+        cache_control.clone()
+    }
+
+    fn last_block_cache_control(message: &Message) -> Option<CacheControl> {
+        match message.content.last() {
+            Content::Text { cache_control, .. }
+            | Content::Image { cache_control, .. }
+            | Content::ToolResult { cache_control, .. }
+            | Content::Document { cache_control, .. } => cache_control,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn claude_code_plan_marks_first_system_block_and_last_message_only() {
+        let mut system = vec![text_system("static"), text_system("dynamic")];
+        let mut messages = vec![user_text("q1"), assistant_text("a1"), user_text("q2")];
+        let mut tools = vec![json!({"name": "t", "input_schema": {"type": "object"}})];
+
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::ClaudeCode,
+        )
+        .unwrap();
+
+        assert!(system_cache_control(&system[0]).is_some());
+        assert!(system_cache_control(&system[1]).is_none());
+        assert!(tools[0].get("cache_control").is_none());
+        assert!(last_block_cache_control(&messages[2]).is_some());
+        assert!(last_block_cache_control(&messages[1]).is_none());
+        assert!(last_block_cache_control(&messages[0]).is_none());
+    }
+
+    #[test]
+    fn claude_code_plan_does_not_mark_a_trailing_thinking_block() {
+        let mut system = vec![text_system("static")];
+        let mut messages = vec![
+            user_text("q1"),
+            message_with(
+                Role::Assistant,
+                vec![
+                    text_content("draft"),
+                    Content::Thinking {
+                        thinking: "deliberating".to_string(),
+                        signature: None,
+                    },
+                ],
+            ),
+        ];
+        let mut tools: Vec<serde_json::Value> = vec![];
+
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::ClaudeCode,
+        )
+        .unwrap();
+
+        // The system prefix is still marked; the message marker is dropped entirely rather
+        // than walking back to the preceding text block (CC `claude.ts:655-662`).
+        assert!(system_cache_control(&system[0]).is_some());
+        let value = serde_json::to_value(&messages[1]).unwrap();
+        assert!(value["content"][0].get("cache_control").is_none());
+        assert!(value["content"][1].get("cache_control").is_none());
+
+        // The skipped breakpoint is not merely unwritable — it is never claimed, so the
+        // marker budget stays intact (Rig's plan spends it on the same unmarkable block).
+        let mut remaining_cache_markers = 4;
+        apply_message_cache_control(
+            &mut messages,
+            &mut remaining_cache_markers,
+            &CacheControl::ephemeral(),
+            CachePlan::ClaudeCode,
+        );
+        assert_eq!(remaining_cache_markers, 4);
+
+        let mut remaining_cache_markers = 4;
+        apply_message_cache_control(
+            &mut messages,
+            &mut remaining_cache_markers,
+            &CacheControl::ephemeral(),
+            CachePlan::Rig,
+        );
+        assert_eq!(remaining_cache_markers, 3);
+    }
+
+    #[test]
+    fn rig_plan_is_unchanged() {
+        let mut system = vec![text_system("static"), text_system("dynamic")];
+        let mut messages = vec![user_text("q1"), assistant_text("a1"), user_text("q2")];
+        let mut tools = vec![
+            json!({"name": "first", "input_schema": {"type": "object"}}),
+            json!({"name": "second", "input_schema": {"type": "object"}}),
+        ];
+
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::Rig,
+        )
+        .unwrap();
+
+        // Final tool, last system block, last message's last block.
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+        assert!(system_cache_control(&system[0]).is_none());
+        assert!(system_cache_control(&system[1]).is_some());
+        assert!(last_block_cache_control(&messages[2]).is_some());
+        assert!(last_block_cache_control(&messages[0]).is_none());
+    }
+
     #[test]
     fn test_prompt_caching_skips_final_deferred_tool_in_request() {
         let request = completion_request_with_tools(
@@ -3511,6 +3761,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3542,6 +3793,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3579,6 +3831,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3615,6 +3868,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3653,6 +3907,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3690,6 +3945,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -3724,6 +3980,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3756,6 +4013,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3798,6 +4056,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3856,6 +4115,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -3907,6 +4167,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -3933,6 +4194,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -3986,6 +4248,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4018,6 +4281,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4060,6 +4324,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: true,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4112,6 +4377,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: true,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -4158,6 +4424,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: true,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -4184,6 +4451,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: true,
             automatic_caching_ttl: Some(CacheTtl::OneHour),
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -4200,6 +4468,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: true,
             automatic_caching_ttl: Some(CacheTtl::OneHour),
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4234,6 +4503,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: true,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4269,6 +4539,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4329,6 +4600,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -4356,6 +4628,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -4377,6 +4650,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: true,
             automatic_caching_ttl: Some(CacheTtl::OneHour),
+            cache_plan: CachePlan::Rig,
         })
         .unwrap_err();
 
@@ -4399,6 +4673,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4429,6 +4704,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 
@@ -4451,6 +4727,7 @@ mod tests {
             prompt_caching: true,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .unwrap();
 

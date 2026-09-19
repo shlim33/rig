@@ -6,8 +6,8 @@ use tracing::{Level, enabled};
 use tracing_futures::Instrument;
 
 use super::completion::{
-    AnthropicCompatibleProvider, AnthropicCompletionRequest, AnthropicRequestParams, CacheTtl,
-    Content, GenericCompletionModel, Usage,
+    AnthropicCompatibleProvider, AnthropicCompletionRequest, AnthropicRequestParams, CachePlan,
+    CacheTtl, Content, GenericCompletionModel, Usage,
 };
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::sse::{Event, GenericEventSource};
@@ -37,6 +37,7 @@ fn create_streaming_request_body(
     prompt_caching: bool,
     automatic_caching: bool,
     automatic_caching_ttl: Option<CacheTtl>,
+    cache_plan: CachePlan,
 ) -> Result<Value, CompletionError> {
     // The typed request's `TryFrom` requires `max_tokens`; feed it the value the
     // caller already resolved (the request's own value, else the model default).
@@ -48,6 +49,7 @@ fn create_streaming_request_body(
         prompt_caching,
         automatic_caching,
         automatic_caching_ttl,
+        cache_plan,
     })?;
 
     let mut body = serde_json::to_value(&request)?;
@@ -261,6 +263,7 @@ where
             self.prompt_caching,
             self.automatic_caching,
             self.automatic_caching_ttl.clone(),
+            self.cache_plan,
         )?;
 
         if enabled!(Level::TRACE) {
@@ -620,7 +623,15 @@ mod tests {
         .unwrap();
         let mut system: Vec<SystemContent> = Vec::new();
         let mut messages: Vec<Message> = Vec::new();
-        apply_prompt_cache_control(&mut system, &mut messages, &mut tools, true, None).unwrap();
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::Rig,
+        )
+        .unwrap();
 
         assert_eq!(tools.len(), 2);
         assert!(tools[0].get("cache_control").is_none());
@@ -661,6 +672,7 @@ mod tests {
             false,
             false,
             None,
+            CachePlan::Rig,
         )
         .expect("streaming request body should build");
 
@@ -717,6 +729,7 @@ mod tests {
             false,
             false,
             None,
+            CachePlan::Rig,
         )
         .expect("streaming request body should build");
 
@@ -744,6 +757,7 @@ mod tests {
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            cache_plan: CachePlan::Rig,
         })
         .expect("blocking request body should build");
         let mut expected = serde_json::to_value(&blocking).expect("serialize blocking body");
@@ -785,6 +799,7 @@ mod tests {
             false,
             false,
             None,
+            CachePlan::Rig,
         )
         .expect("streaming request body should build");
 
@@ -822,6 +837,7 @@ mod tests {
             false,
             false,
             None,
+            CachePlan::Rig,
         )
         .expect("streaming request body should build");
 
@@ -860,6 +876,7 @@ mod tests {
             &mut tools,
             true,
             top_level_cache_control.as_ref(),
+            CachePlan::Rig,
         )
         .unwrap();
 
