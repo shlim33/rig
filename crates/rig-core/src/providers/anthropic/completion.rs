@@ -2210,6 +2210,14 @@ fn apply_message_cache_control(
     }
 }
 
+/// Apply the manual cache breakpoints for `cache_plan`.
+///
+/// `static_system_block_present` says whether `system[0]` is the caller's static prefix
+/// (i.e. it came from the request preamble). It is only consulted by
+/// [`CachePlan::ClaudeCode`], which marks the *first* system block: when the caller has no
+/// static prefix, `system[0]` is a per-turn dynamic block and marking it would invalidate
+/// the breakpoint on every turn, so the system marker is skipped. The message breakpoint is
+/// applied either way. [`CachePlan::Rig`] marks the *last* system block and ignores the flag.
 pub(super) fn apply_prompt_cache_control(
     system: &mut [SystemContent],
     messages: &mut [Message],
@@ -2217,6 +2225,7 @@ pub(super) fn apply_prompt_cache_control(
     prompt_caching: bool,
     top_level_cache_control: Option<&CacheControl>,
     cache_plan: CachePlan,
+    static_system_block_present: bool,
 ) -> Result<(), CompletionError> {
     normalize_tool_cache_control(tools);
 
@@ -2259,11 +2268,13 @@ pub(super) fn apply_prompt_cache_control(
             // Claude Code marks no tool definition: tools precede the system blocks in the
             // cached prefix, so the static system marker already covers them.
             CachePlan::ClaudeCode => {
-                apply_static_system_cache_control(
-                    system,
-                    &mut remaining_cache_markers,
-                    &generated_cache_control,
-                );
+                if static_system_block_present {
+                    apply_static_system_cache_control(
+                        system,
+                        &mut remaining_cache_markers,
+                        &generated_cache_control,
+                    );
+                }
             }
         }
 
@@ -2474,6 +2485,10 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
         } else {
             vec![]
         };
+        // Under `CachePlan::ClaudeCode` the *static* prefix is the preamble, so only a
+        // preamble-derived block may carry the static marker. Remember whether one was
+        // emitted before the per-turn system messages are appended behind it.
+        let static_system_block_present = !system.is_empty();
         system.extend(history_system);
 
         apply_prompt_cache_control(
@@ -2483,6 +2498,7 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             prompt_caching,
             top_level_cache_control.as_ref(),
             cache_plan,
+            static_system_block_present,
         )?;
 
         let output_config = if let Some(schema) = req.output_schema {
@@ -3635,9 +3651,27 @@ mod tests {
             Content::Text { cache_control, .. }
             | Content::Image { cache_control, .. }
             | Content::ToolResult { cache_control, .. }
+            | Content::ToolUse { cache_control, .. }
             | Content::Document { cache_control, .. } => cache_control,
             _ => None,
         }
+    }
+
+    fn tool_use(id: &str) -> Content {
+        Content::ToolUse {
+            id: id.to_string(),
+            name: "calc".to_string(),
+            input: json!({}),
+            cache_control: None,
+        }
+    }
+
+    fn marked_tool(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral"},
+        })
     }
 
     #[test]
@@ -3653,6 +3687,7 @@ mod tests {
             true,
             None,
             CachePlan::ClaudeCode,
+            true,
         )
         .unwrap();
 
@@ -3662,6 +3697,108 @@ mod tests {
         assert!(last_block_cache_control(&messages[2]).is_some());
         assert!(last_block_cache_control(&messages[1]).is_none());
         assert!(last_block_cache_control(&messages[0]).is_none());
+    }
+
+    /// Without a static prefix block the Claude Code plan marks **no** system block — the
+    /// first block is then a per-turn dynamic one and marking it would rewrite the cache on
+    /// every turn. The message breakpoint still lands.
+    #[test]
+    fn claude_code_plan_with_no_static_block_marks_only_the_last_message() {
+        let mut system = vec![text_system("dynamic")];
+        let mut messages = vec![user_text("q1"), assistant_text("a1"), user_text("q2")];
+        let mut tools: Vec<serde_json::Value> = vec![];
+
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::ClaudeCode,
+            false,
+        )
+        .unwrap();
+
+        assert!(system_cache_control(&system[0]).is_none());
+        assert!(last_block_cache_control(&messages[2]).is_some());
+        assert!(last_block_cache_control(&messages[1]).is_none());
+        assert!(last_block_cache_control(&messages[0]).is_none());
+    }
+
+    /// The skipped system marker is never *claimed* either — the budget stays whole. Three
+    /// caller-supplied tool markers leave exactly one of Anthropic's four, and that one must
+    /// reach the last message rather than being burned on the system block that is not marked.
+    #[test]
+    fn claude_code_plan_with_no_static_block_keeps_the_marker_budget() {
+        let mut system = vec![text_system("dynamic")];
+        let mut messages = vec![user_text("q1")];
+        let mut tools = vec![marked_tool("a"), marked_tool("b"), marked_tool("c")];
+
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::ClaudeCode,
+            false,
+        )
+        .unwrap();
+
+        assert!(system_cache_control(&system[0]).is_none());
+        assert!(
+            last_block_cache_control(&messages[0]).is_some(),
+            "the one remaining breakpoint must reach the last message"
+        );
+    }
+
+    /// `CachePlan::Rig` ignores the flag — it marks the *last* system block either way.
+    #[test]
+    fn rig_plan_ignores_the_static_block_flag() {
+        for static_system_block_present in [false, true] {
+            let mut system = vec![text_system("first"), text_system("last")];
+            let mut messages = vec![user_text("q1")];
+            let mut tools: Vec<serde_json::Value> = vec![];
+
+            apply_prompt_cache_control(
+                &mut system,
+                &mut messages,
+                &mut tools,
+                true,
+                None,
+                CachePlan::Rig,
+                static_system_block_present,
+            )
+            .unwrap();
+
+            assert!(system_cache_control(&system[0]).is_none());
+            assert!(system_cache_control(&system[1]).is_some());
+        }
+    }
+
+    /// `cache_control` on `tool_use` blocks is carried for every plan, not just Claude Code's
+    /// — Rig's plan marks the same trailing block and previously dropped the marker there.
+    #[test]
+    fn rig_plan_marks_trailing_tool_use_now() {
+        let mut system = vec![text_system("static")];
+        let mut messages = vec![
+            user_text("q1"),
+            message_with(Role::Assistant, vec![tool_use("toolu_1")]),
+        ];
+        let mut tools: Vec<serde_json::Value> = vec![];
+
+        apply_prompt_cache_control(
+            &mut system,
+            &mut messages,
+            &mut tools,
+            true,
+            None,
+            CachePlan::Rig,
+            true,
+        )
+        .unwrap();
+
+        assert!(last_block_cache_control(&messages[1]).is_some());
     }
 
     /// A trailing `tool_use` block is markable (Anthropic accepts `cache_control` on it),
@@ -3674,12 +3811,7 @@ mod tests {
             user_text("q1"),
             message_with(
                 Role::Assistant,
-                vec![Content::ToolUse {
-                    id: "toolu_1".to_string(),
-                    name: "calc".to_string(),
-                    input: json!({}),
-                    cache_control: None,
-                }],
+                vec![tool_use("toolu_1")],
             ),
         ];
         let mut tools: Vec<serde_json::Value> = vec![];
@@ -3691,6 +3823,7 @@ mod tests {
             true,
             None,
             CachePlan::ClaudeCode,
+            true,
         )
         .unwrap();
 
@@ -3724,6 +3857,7 @@ mod tests {
             true,
             None,
             CachePlan::ClaudeCode,
+            true,
         )
         .unwrap();
 
@@ -3771,6 +3905,7 @@ mod tests {
             true,
             None,
             CachePlan::Rig,
+            true,
         )
         .unwrap();
 

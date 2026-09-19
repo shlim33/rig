@@ -630,6 +630,7 @@ mod tests {
             true,
             None,
             CachePlan::Rig,
+            true,
         )
         .unwrap();
 
@@ -877,6 +878,7 @@ mod tests {
             true,
             top_level_cache_control.as_ref(),
             CachePlan::Rig,
+            true,
         )
         .unwrap();
 
