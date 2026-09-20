@@ -101,6 +101,18 @@ pub enum StreamingEvent {
     },
     MessageStop,
     Ping,
+    /// Anthropic's protocol-level error frame (`event: error`). The API sends it
+    /// *after* a `200 OK` — an overloaded backend, a mid-stream API failure, an
+    /// expired request — and then closes the stream. Without this variant the
+    /// frame fell into [`StreamingEvent::Unknown`] and the stream simply ended,
+    /// which every consumer reads as a normal, complete turn.
+    ///
+    /// The payload is kept as a raw [`Value`] on purpose: the error shapes are
+    /// provider-defined (`overloaded_error`, `api_error`, `rate_limit_error`, …)
+    /// and callers classify them from the JSON text.
+    Error {
+        error: Value,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -347,6 +359,19 @@ where
                                             break;
                                         }
                                     }
+                                    StreamingEvent::Error { error } => {
+                                        // Anthropic closes the connection right
+                                        // after an `error` frame, so there is
+                                        // nothing left to read. Surface it as a
+                                        // provider error and end the stream
+                                        // *without* the trailing FinalResponse —
+                                        // a final response here would look like a
+                                        // completed turn to the caller.
+                                        let message = error.to_string();
+                                        sse_stream.close();
+                                        yield Err(CompletionError::ProviderError(message));
+                                        return;
+                                    }
                                     _ => {}
                                 }
 
@@ -572,6 +597,8 @@ fn handle_event(
         | StreamingEvent::MessageDelta { .. }
         | StreamingEvent::MessageStop
         | StreamingEvent::Ping
+        // Handled by the caller before it reaches here (it terminates the stream).
+        | StreamingEvent::Error { .. }
         | StreamingEvent::Unknown => None,
     }
 }
@@ -1997,6 +2024,79 @@ mod tests {
         assert_eq!(
             usage.output_tokens_details.and_then(|d| d.thinking_tokens),
             Some(0)
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_family = "wasm"))]
+mod error_event_tests {
+    use super::*;
+    use crate::client::CompletionClient;
+    use crate::completion::CompletionModel as _;
+    use crate::providers::anthropic::Client;
+    use crate::providers::anthropic::completion::CLAUDE_SONNET_4_6;
+    use crate::test_utils::MockStreamingClient;
+    use futures::StreamExt;
+
+    const ERROR_FRAME: &str = concat!(
+        r#"{"type":"error","error":{"type":"overloaded_error","#,
+        r#""message":"Overloaded"}}"#,
+    );
+
+    /// An `event: error` frame arriving on a `200 OK` stream must surface as a
+    /// [`CompletionError::ProviderError`] carrying the raw error object, and it
+    /// must be the **last** item: no trailing `FinalResponse`, which every
+    /// consumer reads as a normally completed turn. Before this variant existed
+    /// the frame fell into `StreamingEvent::Unknown` and the stream ended
+    /// cleanly, turning an overloaded backend into a silently empty answer.
+    #[tokio::test]
+    async fn error_event_ends_the_stream_with_a_provider_error() {
+        let sse = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",",
+            "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",",
+            "\"stop_reason\":null,\"stop_sequence\":null,",
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",",
+            "\"message\":\"Overloaded\"}}\n\n",
+        );
+
+        let http_client = MockStreamingClient {
+            sse_bytes: bytes::Bytes::from(sse),
+        };
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(http_client)
+            .build()
+            .expect("build client");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").build();
+
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut items = Vec::new();
+        while let Some(item) = stream.next().await {
+            items.push(item);
+        }
+
+        assert_eq!(items.len(), 1, "only the error item: {items:?}");
+        let Err(CompletionError::ProviderError(msg)) = &items[0] else {
+            panic!("expected ProviderError, got {:?}", items[0]);
+        };
+        assert_eq!(msg, r#"{"message":"Overloaded","type":"overloaded_error"}"#);
+    }
+
+    /// The frame also has to *parse* into the new variant — a regression here
+    /// would silently drop it back into `Unknown`.
+    #[test]
+    fn error_frame_deserializes_into_the_error_variant() {
+        let event: StreamingEvent = serde_json::from_str(ERROR_FRAME).unwrap();
+        let StreamingEvent::Error { error } = &event else {
+            panic!("expected StreamingEvent::Error, got {event:?}");
+        };
+        assert_eq!(error["type"], "overloaded_error");
+        assert!(
+            handle_event(&event, &mut None, &mut HashMap::new(), &mut None).is_none(),
+            "the stream loop handles it, not handle_event"
         );
     }
 }
