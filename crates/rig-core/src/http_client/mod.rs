@@ -19,6 +19,22 @@ pub enum Error {
     InvalidStatusCode(StatusCode),
     #[error("Invalid status code {0} with message: {1}")]
     InvalidStatusCodeWithMessage(StatusCode, String),
+    /// Same shape/Display as [`Self::InvalidStatusCodeWithMessage`] — the only
+    /// difference is `retry_after`, read from the response's `retry-after`
+    /// header. Kept as a **separate** variant (rather than adding a field to
+    /// `InvalidStatusCodeWithMessage`) because several call sites across the
+    /// crate construct that variant directly with exactly two positional
+    /// fields (providers, `test_utils/http.rs`, the `impl_provider_response_helpers!`
+    /// macro); giving it a third field would force every one of those sites to
+    /// change for a capability only the real `send_streaming` response path
+    /// needs. Display is **byte-identical** to `InvalidStatusCodeWithMessage`
+    /// (retry_after never renders) so string-matching callers see no change.
+    #[error("Invalid status code {status} with message: {body}")]
+    InvalidStatusCodeWithHeaders {
+        status: StatusCode,
+        body: String,
+        retry_after: Option<String>,
+    },
     #[error("Header value outside of legal range: {0}")]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error("Request in error state, cannot access headers")]
@@ -37,20 +53,37 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn non_success_status(&self) -> Option<StatusCode> {
+    /// The non-success HTTP status this error carries, when it wraps one.
+    pub fn non_success_status(&self) -> Option<StatusCode> {
         match self {
-            Self::InvalidStatusCode(status) | Self::InvalidStatusCodeWithMessage(status, _) => {
-                Some(*status)
-            }
+            Self::InvalidStatusCode(status)
+            | Self::InvalidStatusCodeWithMessage(status, _)
+            | Self::InvalidStatusCodeWithHeaders { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// The raw response body this error preserved, when it has one.
+    pub fn response_body(&self) -> Option<&str> {
+        match self {
+            Self::InvalidStatusCodeWithMessage(_, body)
+            | Self::InvalidStatusCodeWithHeaders { body, .. } => Some(body.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The `retry-after` response header value, verbatim (not parsed — callers
+    /// decide how to interpret seconds vs. an HTTP-date). Only the header-carrying
+    /// variant (built from a real `send_streaming` non-success response) has one.
+    pub fn retry_after(&self) -> Option<&str> {
+        match self {
+            Self::InvalidStatusCodeWithHeaders { retry_after, .. } => retry_after.as_deref(),
             _ => None,
         }
     }
 
     pub(crate) fn non_success_body(&self) -> Option<&str> {
-        match self {
-            Self::InvalidStatusCodeWithMessage(_, body) => Some(body.as_str()),
-            _ => None,
-        }
+        self.response_body()
     }
 }
 
@@ -73,6 +106,30 @@ async fn non_success_status_error(response: reqwest::Response) -> Error {
         .await
         .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
     Error::InvalidStatusCodeWithMessage(status, message)
+}
+
+/// Same as [`non_success_status_error`] but also preserves the `retry-after`
+/// response header. Used **only** by `send_streaming`'s live non-success path
+/// (the one Anthropic — and every other streaming provider — actually hits):
+/// the header must be read before `.text()` consumes the response body.
+/// `send`/`send_multipart` (`into_lazy_response`) keep calling the plain
+/// `non_success_status_error` above unchanged — several provider call sites
+/// pattern-match `InvalidStatusCodeWithMessage(status, message)` on errors from
+/// those two methods (`client/mod.rs`, `providers/deepseek.rs`,
+/// `providers/xiaomimimo.rs`), and widening what they get back is out of scope
+/// for this change.
+async fn non_success_status_error_with_headers(response: reqwest::Response) -> Error {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("failed to read error response body: {error}"));
+    Error::InvalidStatusCodeWithHeaders { status, body, retry_after }
 }
 
 pub type LazyBytes = WasmBoxedFuture<'static, Result<Bytes>>;
@@ -242,7 +299,7 @@ macro_rules! impl_http_client_ext {
                     let response: reqwest::Response =
                         client.execute(req).await.map_err(instance_error)?;
                     if !response.status().is_success() {
-                        return Err(non_success_status_error(response).await);
+                        return Err(non_success_status_error_with_headers(response).await);
                     }
 
                     #[cfg(not(target_family = "wasm"))]
@@ -281,3 +338,72 @@ impl_http_client_ext!(
     #[cfg_attr(docsrs, doc(cfg(feature = "reqwest-middleware")))]
     reqwest_middleware::ClientWithMiddleware
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The new header-carrying variant must render the **same** Display text as
+    /// the pre-existing `InvalidStatusCodeWithMessage(status, body)` — callers
+    /// (xyrend's `LlmCallError::parse`, downstream provider error strings) match
+    /// on that exact string and must not see it change shape when retry-after
+    /// happens to be present.
+    #[test]
+    fn invalid_status_code_with_headers_display_matches_with_message() {
+        let a = Error::InvalidStatusCodeWithMessage(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down".to_string(),
+        );
+        let b = Error::InvalidStatusCodeWithHeaders {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: "slow down".to_string(),
+            retry_after: Some("7".to_string()),
+        };
+        assert_eq!(a.to_string(), b.to_string());
+        assert_eq!(
+            b.to_string(),
+            "Invalid status code 429 Too Many Requests with message: slow down"
+        );
+    }
+
+    #[test]
+    fn invalid_status_code_with_headers_exposes_status_body_and_retry_after() {
+        let e = Error::InvalidStatusCodeWithHeaders {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: "boom".to_string(),
+            retry_after: Some("30".to_string()),
+        };
+        assert_eq!(e.non_success_status(), Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(e.response_body(), Some("boom"));
+        assert_eq!(e.retry_after(), Some("30"));
+    }
+
+    /// The plain (no-headers) variant still answers `non_success_status`/`response_body`
+    /// (unchanged behaviour) but never carries a retry-after — the accessor is
+    /// specific to the header-carrying variant.
+    #[test]
+    fn invalid_status_code_with_message_has_no_retry_after() {
+        let e = Error::InvalidStatusCodeWithMessage(StatusCode::BAD_REQUEST, "x".to_string());
+        assert_eq!(e.non_success_status(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(e.response_body(), Some("x"));
+        assert_eq!(e.retry_after(), None);
+    }
+
+    /// `InvalidStatusCode` (status only, no body) still yields a status but no
+    /// body/retry-after via the newly-public accessors.
+    #[test]
+    fn invalid_status_code_bare_has_no_body_or_retry_after() {
+        let e = Error::InvalidStatusCode(StatusCode::NOT_FOUND);
+        assert_eq!(e.non_success_status(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(e.response_body(), None);
+        assert_eq!(e.retry_after(), None);
+    }
+
+    #[test]
+    fn unrelated_variant_has_no_status_body_or_retry_after() {
+        let e = Error::StreamEnded;
+        assert_eq!(e.non_success_status(), None);
+        assert_eq!(e.response_body(), None);
+        assert_eq!(e.retry_after(), None);
+    }
+}

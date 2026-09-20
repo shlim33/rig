@@ -156,6 +156,11 @@ pub struct PartialUsage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,
+    /// Breakdown of `output_tokens` (carries `thinking_tokens`). Mirrors
+    /// `completion::Usage::output_tokens_details` — `message_delta.usage` on the
+    /// wire has the same shape as the non-streaming `usage` object.
+    #[serde(default)]
+    pub output_tokens_details: Option<super::completion::OutputTokensDetails>,
 }
 
 impl GetTokenUsage for PartialUsage {
@@ -331,7 +336,8 @@ where
                                                      .filter(|v| *v > 0)
                                                      .or_else(|| usize::try_from(input_tokens).ok()),
                                                  cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                                 cache_read_input_tokens: usage.cache_read_input_tokens
+                                                 cache_read_input_tokens: usage.cache_read_input_tokens,
+                                                 output_tokens_details: usage.output_tokens_details.clone(),
                                             };
 
                                             let span = tracing::Span::current();
@@ -1828,5 +1834,87 @@ mod tests {
         let json = r#"{"type": "something_new_from_anthropic", "field": "x"}"#;
         let delta: ContentDelta = serde_json::from_str(json).unwrap();
         assert!(matches!(delta, ContentDelta::Unknown));
+    }
+
+    /// Real `message_delta.usage.output_tokens_details.thinking_tokens` on the
+    /// wire must survive into the `FinalResponse`'s `PartialUsage` — this is the
+    /// exact assembly xyrend's `anthropic_wire::final_usage` reads
+    /// (`r.usage.output_tokens_details`). Drives the full `CompletionModel::stream`
+    /// through a real SSE byte stream (not `handle_event` directly) so the
+    /// `message_delta` usage-merge closure (this file, `stream()`) is what's
+    /// actually under test.
+    async fn stream_with_message_delta_usage(usage_json: &str) -> PartialUsage {
+        use crate::client::CompletionClient;
+        use crate::completion::CompletionModel as _;
+        use crate::providers::anthropic::Client;
+        use crate::providers::anthropic::completion::CLAUDE_SONNET_4_6;
+        use crate::test_utils::MockStreamingClient;
+
+        let sse = format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_1\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",",
+                "\"stop_reason\":null,\"stop_sequence\":null,",
+                "\"usage\":{{\"input_tokens\":10,\"output_tokens\":0}}}}}}\n\n",
+                "data: {{\"type\":\"content_block_start\",\"index\":0,",
+                "\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{{\"type\":\"text_delta\",\"text\":\"hi\"}}}}\n\n",
+                "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                "data: {{\"type\":\"message_delta\",",
+                "\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},",
+                "\"usage\":{{\"output_tokens\":5{usage_json}}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            usage_json = usage_json,
+        );
+
+        let http_client = MockStreamingClient { sse_bytes: bytes::Bytes::from(sse) };
+        let client = Client::builder()
+            .api_key("test-key")
+            .http_client(http_client)
+            .build()
+            .expect("build client");
+        let model = client.completion_model(CLAUDE_SONNET_4_6);
+        let request = model.completion_request("hello").build();
+
+        let mut stream = model.stream(request).await.expect("stream should start");
+        let mut final_usage = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(crate::streaming::StreamedAssistantContent::Final(r)) = item {
+                final_usage = Some(r.usage);
+            }
+        }
+        final_usage.expect("stream should yield a FinalResponse")
+    }
+
+    #[tokio::test]
+    async fn message_delta_usage_carries_thinking_tokens_when_present() {
+        let usage = stream_with_message_delta_usage(
+            r#","output_tokens_details":{"thinking_tokens":123}"#,
+        )
+        .await;
+        assert_eq!(
+            usage.output_tokens_details.and_then(|d| d.thinking_tokens),
+            Some(123)
+        );
+    }
+
+    #[tokio::test]
+    async fn message_delta_usage_thinking_tokens_absent_when_key_missing() {
+        let usage = stream_with_message_delta_usage("").await;
+        assert!(usage.output_tokens_details.is_none());
+    }
+
+    #[tokio::test]
+    async fn message_delta_usage_thinking_tokens_zero_is_some_zero() {
+        let usage = stream_with_message_delta_usage(
+            r#","output_tokens_details":{"thinking_tokens":0}"#,
+        )
+        .await;
+        assert_eq!(
+            usage.output_tokens_details.and_then(|d| d.thinking_tokens),
+            Some(0)
+        );
     }
 }

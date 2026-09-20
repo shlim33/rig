@@ -109,6 +109,21 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub output_tokens: u64,
+    /// Breakdown of `output_tokens`. Absent on providers/gateways that don't
+    /// report it; `#[serde(default)]` so older captured fixtures without this
+    /// key keep deserializing.
+    #[serde(default)]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+}
+
+/// Breakdown of an Anthropic response's `output_tokens`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OutputTokensDetails {
+    /// Extended-thinking tokens included in `output_tokens`. `#[serde(default)]`
+    /// so a payload that omits the key (rather than sending `0`) still parses —
+    /// the two are meaningfully different (no thinking vs. reported-zero).
+    #[serde(default)]
+    pub thinking_tokens: Option<u64>,
 }
 
 impl std::fmt::Display for Usage {
@@ -5451,6 +5466,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 output_tokens: 2,
+                output_tokens_details: None,
             },
         };
 
@@ -5479,6 +5495,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 output_tokens: 2,
+                output_tokens_details: None,
             },
         };
 
@@ -6096,6 +6113,7 @@ mod tests {
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
                 output_tokens: 1,
+                output_tokens_details: None,
             },
         };
 
@@ -6499,5 +6517,41 @@ mod tests {
                 "URL PDF should map to a url document source: {json:#}"
             );
         }
+    }
+
+    #[test]
+    fn usage_deserializes_output_tokens_details_when_present() {
+        let usage: Usage = serde_json::from_str(
+            r#"{"input_tokens":10,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"output_tokens":20,"output_tokens_details":{"thinking_tokens":123}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage.output_tokens_details.and_then(|d| d.thinking_tokens),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn usage_deserializes_output_tokens_details_when_absent() {
+        // Older fixtures / providers that never send the key at all.
+        let usage: Usage = serde_json::from_str(
+            r#"{"input_tokens":10,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"output_tokens":20}"#,
+        )
+        .unwrap();
+        assert!(usage.output_tokens_details.is_none());
+    }
+
+    #[test]
+    fn usage_deserializes_thinking_tokens_zero_as_some_zero() {
+        // A reported zero is meaningfully different from "not reported" —
+        // xyrend's TurnUsage.thinking_tokens must be able to tell them apart.
+        let usage: Usage = serde_json::from_str(
+            r#"{"input_tokens":10,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"output_tokens":20,"output_tokens_details":{"thinking_tokens":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage.output_tokens_details.and_then(|d| d.thinking_tokens),
+            Some(0)
+        );
     }
 }
