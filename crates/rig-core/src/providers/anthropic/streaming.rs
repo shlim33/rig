@@ -506,7 +506,7 @@ fn handle_event(
         },
         StreamingEvent::ContentBlockStop { index } => {
             if let Some(thinking_state) = Option::take(current_thinking)
-                && !thinking_state.thinking.is_empty()
+                && (!thinking_state.thinking.is_empty() || !thinking_state.signature.is_empty())
             {
                 let signature = if thinking_state.signature.is_empty() {
                     None
@@ -1042,6 +1042,88 @@ mod tests {
         // But signature should be captured in thinking state
         assert!(thinking_state.is_some());
         assert_eq!(thinking_state.unwrap().signature, "test_signature");
+    }
+
+    /// `display: "omitted"` (adaptive/budget thinking requested with the response text
+    /// suppressed) — Anthropic still sends a `thinking` content block, but its
+    /// `thinking_delta` text is the empty string; only a `signature_delta` carries real
+    /// content. Before this fix, `ContentBlockStop`'s guard required non-empty thinking
+    /// text to emit the completed block, so the signature was accumulated into local
+    /// `ThinkingState` and then silently discarded — no event ever surfaced it to callers,
+    /// making multi-turn round-trip of the signature impossible. The completed block must
+    /// still surface (with `thinking: ""`) whenever either the text or the signature is
+    /// non-empty.
+    #[test]
+    fn test_content_block_stop_emits_signature_only_thinking_block() {
+        let start = StreamingEvent::ContentBlockStart {
+            index: 0,
+            content_block: Content::Thinking {
+                thinking: String::new(),
+                signature: None,
+            },
+        };
+        let mut tool_call_state = None;
+        let mut thinking_state = None;
+        assert!(handle_event(&start, &mut tool_call_state, &mut thinking_state).is_none());
+
+        let delta = StreamingEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::ThinkingDelta {
+                thinking: String::new(),
+            },
+        };
+        let result = handle_event(&delta, &mut tool_call_state, &mut thinking_state);
+        match result {
+            Some(Ok(RawStreamingChoice::ReasoningDelta { reasoning, .. })) => {
+                assert_eq!(reasoning, "");
+            }
+            other => panic!("expected an empty ReasoningDelta, got {other:?}"),
+        }
+
+        let sig = StreamingEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentDelta::SignatureDelta {
+                signature: "sig-abc".to_string(),
+            },
+        };
+        assert!(handle_event(&sig, &mut tool_call_state, &mut thinking_state).is_none());
+
+        let stop = StreamingEvent::ContentBlockStop { index: 0 };
+        let result = handle_event(&stop, &mut tool_call_state, &mut thinking_state);
+        match result {
+            Some(Ok(RawStreamingChoice::Reasoning {
+                content: ReasoningContent::Text { text, signature },
+                ..
+            })) => {
+                assert_eq!(text, "");
+                assert_eq!(signature, Some("sig-abc".to_string()));
+            }
+            other => panic!("expected a signature-only Reasoning block, got {other:?}"),
+        }
+    }
+
+    /// Companion regression to the test above: a thinking block with **neither** text
+    /// **nor** a signature (no deltas at all between start and stop) must stay silent, as
+    /// before this fix — the `||` relaxation must not start emitting no-op blocks.
+    #[test]
+    fn test_content_block_stop_with_no_text_and_no_signature_emits_nothing() {
+        let start = StreamingEvent::ContentBlockStart {
+            index: 0,
+            content_block: Content::Thinking {
+                thinking: String::new(),
+                signature: None,
+            },
+        };
+        let mut tool_call_state = None;
+        let mut thinking_state = None;
+        assert!(handle_event(&start, &mut tool_call_state, &mut thinking_state).is_none());
+
+        let stop = StreamingEvent::ContentBlockStop { index: 0 };
+        let result = handle_event(&stop, &mut tool_call_state, &mut thinking_state);
+        assert!(
+            result.is_none(),
+            "a genuinely empty block (no text, no signature) must stay silent: {result:?}"
+        );
     }
 
     #[test]
